@@ -1,0 +1,19 @@
+# Python / Streamlit
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Local data
+history.csv
+budgets.csv
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.cursor/
