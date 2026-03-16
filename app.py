@@ -15,6 +15,8 @@ from typing import Optional, Iterable, Any
 import streamlit as st
 from PIL import Image
 import google.generativeai as genai
+from google.oauth2.service_account import Credentials
+import gspread
 
 APP_DIR = Path(__file__).resolve().parent
 HISTORY_CSV_PATH = APP_DIR / "history.csv"
@@ -32,6 +34,9 @@ HISTORY_COLUMNS = [
 ]
 
 BUDGET_COLUMNS = ["YearMonth", "Category", "Budget_ISK"]
+
+GSHEET_HISTORY_TAB = "history"
+GSHEET_BUDGETS_TAB = "budgets"
 
 
 def fmt_isk(value: Any) -> str:
@@ -52,6 +57,198 @@ def as_int(value: Any, default: int = 0) -> int:
 def yearmonth(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
+def _get_gsheets_client_and_sheet():
+    """
+    Uses Streamlit secrets:
+      - GSHEETS_SHEET_ID: Google Sheet ID
+      - GOOGLE_SERVICE_ACCOUNT_JSON: service account JSON (string) OR a TOML dict via st.secrets
+    """
+    sheet_id = None
+    try:
+        sheet_id = (st.secrets.get("GSHEETS_SHEET_ID") or "").strip()
+    except Exception:
+        sheet_id = ""
+    if not sheet_id:
+        return None
+
+    sa = None
+    try:
+        sa = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    except Exception:
+        sa = None
+    if isinstance(sa, str):
+        try:
+            sa_info = json.loads(sa)
+        except Exception:
+            sa_info = None
+    elif isinstance(sa, dict):
+        sa_info = sa
+    else:
+        sa_info = None
+
+    if not isinstance(sa_info, dict):
+        return None
+
+    creds = Credentials.from_service_account_info(
+        sa_info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+        ],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id)
+    return sh
+
+
+def _ensure_ws(sh, title: str, header: list[str]):
+    try:
+        ws = sh.worksheet(title)
+    except Exception:
+        ws = sh.add_worksheet(title=title, rows=1000, cols=max(8, len(header)))
+    # Ensure header row exists
+    existing = ws.row_values(1)
+    if [h.strip() for h in existing] != header:
+        ws.clear()
+        ws.append_row(header, value_input_option="RAW")
+    return ws
+
+
+def _gsheets_load_history_rows() -> list[dict]:
+    sh = _get_gsheets_client_and_sheet()
+    if sh is None:
+        return []
+    ws = _ensure_ws(sh, GSHEET_HISTORY_TAB, HISTORY_COLUMNS)
+    records = ws.get_all_records()
+    rows: list[dict] = []
+    for idx, row in enumerate(records):
+        try:
+            purchased_on = datetime.strptime(str(row.get("Date", "")), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        row_id = str(row.get("Row_ID", "")).strip()
+        if not row_id:
+            row_id = hashlib.sha1(
+                f"{row.get('Merchant','')}-{row.get('Date')}-{row.get('Item','')}-{row.get('Price_ISK',0)}-{idx}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:16]
+        rows.append(
+            {
+                "Row_ID": row_id,
+                "Merchant": (row.get("Merchant") or "").strip() or "Unknown",
+                "Date": purchased_on,
+                "Item": (row.get("Item") or "").strip(),
+                "Standard_Name": (row.get("Standard_Name") or "").strip()
+                or (row.get("Item") or "").strip(),
+                "Quantity": as_int(row.get("Quantity", 1), default=1),
+                "Price_ISK": as_int(row.get("Price_ISK", 0), default=0),
+                "Category": (row.get("Category") or "Other").strip() or "Other",
+            }
+        )
+    return rows
+
+
+def _gsheets_save_history_rows(rows: list[dict]) -> None:
+    sh = _get_gsheets_client_and_sheet()
+    if sh is None:
+        raise RuntimeError("Google Sheets is not configured.")
+    ws = _ensure_ws(sh, GSHEET_HISTORY_TAB, HISTORY_COLUMNS)
+    values = [HISTORY_COLUMNS]
+    for r in rows:
+        item = (r.get("Item") or "").strip()
+        if not item:
+            continue
+        purchased_on: date = r["Date"]
+        values.append(
+            [
+                (r.get("Row_ID") or "").strip() or uuid.uuid4().hex,
+                (r.get("Merchant") or "").strip() or "Unknown",
+                purchased_on.isoformat(),
+                item,
+                (r.get("Standard_Name") or "").strip() or item,
+                max(1, as_int(r.get("Quantity", 1), default=1)),
+                as_int(r.get("Price_ISK", 0), default=0),
+                (r.get("Category") or "Other").strip() or "Other",
+            ]
+        )
+    ws.clear()
+    ws.update(values, value_input_option="RAW")
+
+
+def _gsheets_append_history_rows(*, merchant: str, purchased_on: date, items: Iterable[dict]) -> int:
+    sh = _get_gsheets_client_and_sheet()
+    if sh is None:
+        return 0
+    ws = _ensure_ws(sh, GSHEET_HISTORY_TAB, HISTORY_COLUMNS)
+    out_rows = []
+    for it in items:
+        item_name = (it.get("item") or "").strip()
+        if not item_name:
+            continue
+        std_name = (it.get("standard_name") or it.get("Standard_Name") or "").strip() or item_name
+        out_rows.append(
+            [
+                uuid.uuid4().hex,
+                merchant,
+                purchased_on.isoformat(),
+                item_name,
+                std_name,
+                as_int(it.get("quantity", 1), default=1),
+                as_int(it.get("price_isk", 0), default=0),
+                (it.get("category") or "Other").strip() or "Other",
+            ]
+        )
+    if not out_rows:
+        return 0
+    ws.append_rows(out_rows, value_input_option="RAW")
+    return len(out_rows)
+
+
+def _gsheets_load_budgets() -> list[dict]:
+    sh = _get_gsheets_client_and_sheet()
+    if sh is None:
+        return []
+    ws = _ensure_ws(sh, GSHEET_BUDGETS_TAB, BUDGET_COLUMNS)
+    records = ws.get_all_records()
+    out = []
+    for row in records:
+        ym = (row.get("YearMonth") or "").strip()
+        cat = (row.get("Category") or "").strip()
+        if not ym or not cat:
+            continue
+        out.append(
+            {
+                "YearMonth": ym,
+                "Category": cat,
+                "Budget_ISK": as_int(row.get("Budget_ISK", 0), default=0),
+            }
+        )
+    return out
+
+
+def _gsheets_save_budgets(rows: list[dict]) -> None:
+    sh = _get_gsheets_client_and_sheet()
+    if sh is None:
+        raise RuntimeError("Google Sheets is not configured.")
+    ws = _ensure_ws(sh, GSHEET_BUDGETS_TAB, BUDGET_COLUMNS)
+    values = [BUDGET_COLUMNS]
+    for r in rows:
+        ym = (r.get("YearMonth") or "").strip()
+        cat = (r.get("Category") or "").strip()
+        if not ym or not cat:
+            continue
+        values.append([ym, cat, as_int(r.get("Budget_ISK", 0), default=0)])
+    ws.clear()
+    ws.update(values, value_input_option="RAW")
+
+
+def using_gsheets() -> bool:
+    try:
+        return bool((st.secrets.get("GSHEETS_SHEET_ID") or "").strip()) and bool(st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    except Exception:
+        return False
+
 
 def ensure_budgets_csv_exists() -> None:
     if BUDGETS_CSV_PATH.exists():
@@ -62,6 +259,8 @@ def ensure_budgets_csv_exists() -> None:
 
 
 def load_budgets() -> list[dict]:
+    if using_gsheets():
+        return _gsheets_load_budgets()
     if not BUDGETS_CSV_PATH.exists():
         return []
     with BUDGETS_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
@@ -83,6 +282,9 @@ def load_budgets() -> list[dict]:
 
 
 def save_budgets(rows: list[dict]) -> None:
+    if using_gsheets():
+        _gsheets_save_budgets(rows)
+        return
     ensure_budgets_csv_exists()
     with BUDGETS_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=BUDGET_COLUMNS)
@@ -151,6 +353,8 @@ def append_history_rows(
     purchased_on: date,
     items: Iterable[dict],
 ) -> int:
+    if using_gsheets():
+        return _gsheets_append_history_rows(merchant=merchant, purchased_on=purchased_on, items=items)
     ensure_history_csv_exists_and_up_to_date()
     wrote = 0
     with HISTORY_CSV_PATH.open("a", newline="", encoding="utf-8") as f:
@@ -204,11 +408,16 @@ def _write_history_rows_no_upgrade(rows: list[dict]) -> None:
 
 
 def save_history_rows(rows: list[dict]) -> None:
+    if using_gsheets():
+        _gsheets_save_history_rows(rows)
+        return
     ensure_history_csv_exists_and_up_to_date()
     _write_history_rows_no_upgrade(rows)
 
 
 def load_history_rows(*, allow_upgrade: bool = True) -> list[dict]:
+    if using_gsheets():
+        return _gsheets_load_history_rows()
     if allow_upgrade:
         ensure_history_csv_exists_and_up_to_date()
     if not HISTORY_CSV_PATH.exists():

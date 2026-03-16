@@ -17,3 +17,6 @@ budgets.csv
 Thumbs.db
 .vscode/
 .cursor/
+
+*.json
+.streamlit/secrets.toml
