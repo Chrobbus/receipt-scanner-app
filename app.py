@@ -601,8 +601,7 @@ with tab_scanner:
                 wrote = append_history_rows(merchant=merchant, purchased_on=purchased_on, items=items)
                 st.session_state["last_accepted_receipt_id"] = receipt_id
                 if wrote:
-                    backend = "Google Sheets" if using_gsheets() else "history.csv"
-		    st.success(f"Saved {wrote} items to {backend}.")
+                    st.success(f"Saved {wrote} items to `history.csv`.")
                 else:
                     st.warning("Nothing was saved (no valid line items found).")
         else:
