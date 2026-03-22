@@ -81,8 +81,8 @@ def _get_gsheets_client_and_sheet():
             sa_info = json.loads(sa)
         except Exception:
             sa_info = None
-    elif isinstance(sa, dict):
-        sa_info = sa
+    elif hasattr(sa, 'items'):
+        sa_info = dict(sa)
     else:
         sa_info = None
 
