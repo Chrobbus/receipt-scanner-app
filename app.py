@@ -459,14 +459,6 @@ def load_history_rows(*, allow_upgrade: bool = True) -> list[dict]:
 
 st.set_page_config(page_title="Receipt Scanner", page_icon="🧾", layout="centered")
 st.title("🧾 Receipt Scanner")
-st.write("Using GSheets:", using_gsheets())
-try:
-    sh = _get_gsheets_client_and_sheet()
-    st.write("Sheet connected:", sh is not None)
-    if sh is not None:
-        st.write("Sheet title:", sh.title)
-except Exception as e:
-    st.error(f"GSheets connection error: {e}")
 st.caption("Scan receipts and build a spending history you can filter and summarize.")
 
 # --- API key: from secrets or sidebar ---
