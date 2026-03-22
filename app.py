@@ -179,7 +179,7 @@ def _gsheets_save_history_rows(rows: list[dict]) -> None:
 def _gsheets_append_history_rows(*, merchant: str, purchased_on: date, items: Iterable[dict]) -> int:
     sh = _get_gsheets_client_and_sheet()
     if sh is None:
-        return 0
+        raise RuntimeError("Could not connect to Google Sheets — check secrets.")
     ws = _ensure_ws(sh, GSHEET_HISTORY_TAB, HISTORY_COLUMNS)
     out_rows = []
     for it in items:
@@ -455,6 +455,14 @@ def load_history_rows(*, allow_upgrade: bool = True) -> list[dict]:
 
 st.set_page_config(page_title="Receipt Scanner", page_icon="🧾", layout="centered")
 st.title("🧾 Receipt Scanner")
+st.write("Using GSheets:", using_gsheets())
+try:
+    sh = _get_gsheets_client_and_sheet()
+    st.write("Sheet connected:", sh is not None)
+    if sh is not None:
+        st.write("Sheet title:", sh.title)
+except Exception as e:
+    st.error(f"GSheets connection error: {e}")
 st.caption("Scan receipts and build a spending history you can filter and summarize.")
 
 # --- API key: from secrets or sidebar ---
@@ -598,12 +606,15 @@ with tab_scanner:
             if already_saved:
                 st.caption("Already saved for this receipt in this session.")
             if accept:
-                wrote = append_history_rows(merchant=merchant, purchased_on=purchased_on, items=items)
-                st.session_state["last_accepted_receipt_id"] = receipt_id
-                if wrote:
-                    st.success(f"Saved {wrote} items to `history.csv`.")
-                else:
-                    st.warning("Nothing was saved (no valid line items found).")
+                try:
+                    wrote = append_history_rows(merchant=merchant, purchased_on=purchased_on, items=items)
+                    st.session_state["last_accepted_receipt_id"] = receipt_id
+                    if wrote:
+                        st.success(f"Saved {wrote} items to history.")
+                    else:
+                        st.warning("Nothing was saved (no valid line items found).")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
         else:
             st.info("No line items were extracted from this receipt.")
     else:
