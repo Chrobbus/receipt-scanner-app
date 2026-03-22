@@ -89,16 +89,20 @@ def _get_gsheets_client_and_sheet():
     if not isinstance(sa_info, dict):
         return None
 
-    creds = Credentials.from_service_account_info(
-        sa_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-        ],
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
-    return sh
+    try:
+        creds = Credentials.from_service_account_info(
+            sa_info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
+        return sh
+    except Exception as e:
+        st.error(f"GSheets internal error: {e}")
+        return None
 
 
 def _ensure_ws(sh, title: str, header: list[str]):
