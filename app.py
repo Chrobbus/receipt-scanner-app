@@ -2,11 +2,14 @@
 Receipt Scanner App - Uses Google Gemini to analyze receipt images and extract
 a table with Item, Quantity, Price (ISK), Category, plus merchant detection.
 
-IMPROVEMENTS:
+Features:
 - Enhanced prompt tuned for Bónus, Krónan, Costco Icelandic receipts
 - Editable review table before saving (fix errors before they enter your data)
 - Product dictionary that learns from your corrections (auto-corrects future scans)
 - Post-processing to filter junk lines (discounts, subtotals, payment lines)
+- Me / AG / Shared spending attribution
+- Clean categories: Food, Fast Food, Candy & Snacks, Drinks, Alcohol,
+  Clothing, Household, Health & Beauty, Other
 """
 import json
 import re
@@ -29,6 +32,21 @@ HISTORY_CSV_PATH = APP_DIR / "history.csv"
 BUDGETS_CSV_PATH = APP_DIR / "budgets.csv"
 DICTIONARY_CSV_PATH = APP_DIR / "product_dictionary.csv"
 
+# ── Fixed categories ──────────────────────────────────────────────────
+CATEGORIES = [
+    "Food",
+    "Fast Food",
+    "Candy & Snacks",
+    "Drinks",
+    "Alcohol",
+    "Clothing",
+    "Household",
+    "Health & Beauty",
+    "Other",
+]
+
+FOR_OPTIONS = ["Shared", "Me", "AG"]
+
 HISTORY_COLUMNS = [
     "Row_ID",
     "Merchant",
@@ -38,11 +56,12 @@ HISTORY_COLUMNS = [
     "Quantity",
     "Price_ISK",
     "Category",
+    "For",
 ]
 
 BUDGET_COLUMNS = ["YearMonth", "Category", "Budget_ISK"]
 
-DICTIONARY_COLUMNS = ["OCR_Name", "Corrected_Name", "Standard_Name", "Category", "Merchant"]
+DICTIONARY_COLUMNS = ["OCR_Name", "Corrected_Name", "Standard_Name", "Category", "For", "Merchant"]
 
 GSHEET_HISTORY_TAB = "history"
 GSHEET_BUDGETS_TAB = "budgets"
@@ -50,45 +69,42 @@ GSHEET_DICTIONARY_TAB = "dictionary"
 
 
 # ── Icelandic junk-line patterns ──────────────────────────────────────
-# Lines matching these are NOT real products — they're subtotals, discounts,
-# payment methods, deposit fees, bag charges, etc.
 JUNK_PATTERNS = [
-    r"(?i)^samtals",          # Samtals / Total
-    r"(?i)^alls\b",           # Alls
-    r"(?i)^afsl[aá]tt",       # Afsláttur (discount)
-    r"(?i)^greiðsla",         # Greiðsla (payment)
-    r"(?i)^debetkort",        # Debit card
-    r"(?i)^kreditkort",       # Credit card
-    r"(?i)^kort\b",           # Kort (card)
-    r"(?i)^mynt\b",           # Mynt (coin)
-    r"(?i)^innborgun",        # Innborgun (deposit)
-    r"(?i)^skilagjald",       # Skilagjald (deposit fee) — keep only if user wants
-    r"(?i)^poki\b",           # Poki (bag)
-    r"(?i)^plastpoki",        # Plastpoki (plastic bag)
-    r"(?i)^burðarpoki",       # Burðarpoki (carrier bag)
-    r"(?i)^v(ir)?ðisaukaskattur", # VAT
-    r"(?i)^vsk\b",            # VSK (VAT abbreviation)
-    r"(?i)^breyting",         # Breyting (change)
-    r"(?i)^til baka",         # Til baka (change back)
-    r"(?i)^millisamtala",     # Millisamtala (subtotal)
-    r"(?i)^fjöldi vara",      # Fjöldi vara (number of items)
-    r"(?i)^línur\b",          # Línur (lines count)
-    r"(?i)^kennitala",        # Kennitala (ID number)
-    r"(?i)^dags\b",           # Dags (date line)
-    r"(?i)^kl\.\s*\d",        # Kl. 14:30 (time)
-    r"(?i)^kvittun",          # Kvittun (receipt)
-    r"(?i)^auðkenni",         # Auðkenni (identifier)
-    r"(?i)^afgreiðslu",       # Afgreiðslumaður (cashier)
-    r"(?i)^kassi\b",          # Kassi (register)
-    r"(?i)^takk\b",           # Takk (thank you)
-    r"(?i)^opnunart",         # Opnunartímar (opening hours)
-    r"(?i)^s[ií]mi\b",        # Sími (phone)
+    r"(?i)^samtals",
+    r"(?i)^alls\b",
+    r"(?i)^afsl[aá]tt",
+    r"(?i)^greiðsla",
+    r"(?i)^debetkort",
+    r"(?i)^kreditkort",
+    r"(?i)^kort\b",
+    r"(?i)^mynt\b",
+    r"(?i)^innborgun",
+    r"(?i)^skilagjald",
+    r"(?i)^poki\b",
+    r"(?i)^plastpoki",
+    r"(?i)^burðarpoki",
+    r"(?i)^v(ir)?ðisaukaskattur",
+    r"(?i)^vsk\b",
+    r"(?i)^breyting",
+    r"(?i)^til baka",
+    r"(?i)^millisamtala",
+    r"(?i)^fjöldi vara",
+    r"(?i)^línur\b",
+    r"(?i)^kennitala",
+    r"(?i)^dags\b",
+    r"(?i)^kl\.\s*\d",
+    r"(?i)^kvittun",
+    r"(?i)^auðkenni",
+    r"(?i)^afgreiðslu",
+    r"(?i)^kassi\b",
+    r"(?i)^takk\b",
+    r"(?i)^opnunart",
+    r"(?i)^s[ií]mi\b",
 ]
 JUNK_RE = [re.compile(p) for p in JUNK_PATTERNS]
 
 
 def is_junk_line(item_name: str) -> bool:
-    """Return True if this looks like a non-product receipt line."""
     name = item_name.strip()
     if not name:
         return True
@@ -124,7 +140,6 @@ def _get_gsheets_client_and_sheet():
         sheet_id = ""
     if not sheet_id:
         return None
-
     sa = None
     try:
         sa = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -139,10 +154,8 @@ def _get_gsheets_client_and_sheet():
         sa_info = dict(sa)
     else:
         sa_info = None
-
     if not isinstance(sa_info, dict):
         return None
-
     try:
         creds = Credentials.from_service_account_info(
             sa_info,
@@ -163,11 +176,26 @@ def _ensure_ws(sh, title: str, header: list[str]):
     try:
         ws = sh.worksheet(title)
     except Exception:
-        ws = sh.add_worksheet(title=title, rows=1000, cols=max(8, len(header)))
+        ws = sh.add_worksheet(title=title, rows=1000, cols=max(10, len(header)))
     existing = ws.row_values(1)
     if [h.strip() for h in existing] != header:
-        ws.clear()
-        ws.append_row(header, value_input_option="RAW")
+        # If only missing the new "For" column, migrate instead of clearing
+        existing_stripped = [h.strip() for h in existing]
+        if title == GSHEET_HISTORY_TAB and "For" not in existing_stripped and len(existing_stripped) >= 8:
+            # Add the For column header and default existing rows
+            ws.update_cell(1, len(existing_stripped) + 1, "For")
+            # Fill default "Shared" for all existing data rows
+            all_vals = ws.get_all_values()
+            if len(all_vals) > 1:
+                for row_idx in range(2, len(all_vals) + 1):
+                    ws.update_cell(row_idx, len(existing_stripped) + 1, "Shared")
+        elif not existing_stripped:
+            ws.clear()
+            ws.append_row(header, value_input_option="RAW")
+        else:
+            # Full reset only if header is very different
+            ws.clear()
+            ws.append_row(header, value_input_option="RAW")
     return ws
 
 
@@ -178,10 +206,9 @@ def using_gsheets() -> bool:
         return False
 
 
-# ── Product Dictionary (learning from corrections) ────────────────────
+# ── Product Dictionary ────────────────────────────────────────────────
 
 def load_dictionary() -> list[dict]:
-    """Load the product dictionary (OCR→corrected name mappings)."""
     if using_gsheets():
         sh = _get_gsheets_client_and_sheet()
         if sh is None:
@@ -194,12 +221,12 @@ def load_dictionary() -> list[dict]:
                 "Corrected_Name": (r.get("Corrected_Name") or "").strip(),
                 "Standard_Name": (r.get("Standard_Name") or "").strip(),
                 "Category": (r.get("Category") or "").strip(),
+                "For": (r.get("For") or "").strip(),
                 "Merchant": (r.get("Merchant") or "").strip(),
             }
             for r in records
             if (r.get("OCR_Name") or "").strip()
         ]
-    # CSV fallback
     if not DICTIONARY_CSV_PATH.exists():
         return []
     with DICTIONARY_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
@@ -210,6 +237,7 @@ def load_dictionary() -> list[dict]:
                 "Corrected_Name": (r.get("Corrected_Name") or "").strip(),
                 "Standard_Name": (r.get("Standard_Name") or "").strip(),
                 "Category": (r.get("Category") or "").strip(),
+                "For": (r.get("For") or "").strip(),
                 "Merchant": (r.get("Merchant") or "").strip(),
             }
             for r in reader
@@ -218,7 +246,6 @@ def load_dictionary() -> list[dict]:
 
 
 def save_dictionary(entries: list[dict]) -> None:
-    """Save the full product dictionary."""
     if using_gsheets():
         sh = _get_gsheets_client_and_sheet()
         if sh is None:
@@ -231,12 +258,12 @@ def save_dictionary(entries: list[dict]) -> None:
                 (e.get("Corrected_Name") or "").strip(),
                 (e.get("Standard_Name") or "").strip(),
                 (e.get("Category") or "").strip(),
+                (e.get("For") or "").strip(),
                 (e.get("Merchant") or "").strip(),
             ])
         ws.clear()
         ws.update(values, value_input_option="RAW")
         return
-    # CSV fallback
     with DICTIONARY_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=DICTIONARY_COLUMNS)
         w.writeheader()
@@ -246,30 +273,19 @@ def save_dictionary(entries: list[dict]) -> None:
                 "Corrected_Name": (e.get("Corrected_Name") or "").strip(),
                 "Standard_Name": (e.get("Standard_Name") or "").strip(),
                 "Category": (e.get("Category") or "").strip(),
+                "For": (e.get("For") or "").strip(),
                 "Merchant": (e.get("Merchant") or "").strip(),
             })
 
 
-def _normalize_for_match(name: str) -> str:
-    """Lowercase and strip accents lightly for fuzzy matching."""
-    return name.strip().lower()
-
-
 def apply_dictionary(items: list[dict], merchant: str) -> list[dict]:
-    """
-    Apply dictionary corrections to Gemini output.
-    If the OCR name matches a known entry, replace item name, standard_name, and category.
-    """
     dictionary = load_dictionary()
     if not dictionary:
         return items
-
-    # Build lookup: ocr_name → best match (prefer merchant-specific)
     lookup: dict[str, dict] = {}
     for entry in dictionary:
         key = entry["OCR_Name"]
         existing = lookup.get(key)
-        # Merchant-specific entries take priority
         if existing is None:
             lookup[key] = entry
         elif entry["Merchant"].lower() == merchant.lower() and existing["Merchant"].lower() != merchant.lower():
@@ -277,16 +293,18 @@ def apply_dictionary(items: list[dict], merchant: str) -> list[dict]:
 
     corrected = []
     for item in items:
-        ocr_key = _normalize_for_match(item.get("item", ""))
+        ocr_key = (item.get("item") or "").strip().lower()
         match = lookup.get(ocr_key)
         if match:
-            item = dict(item)  # copy
+            item = dict(item)
             if match["Corrected_Name"]:
                 item["item"] = match["Corrected_Name"]
             if match["Standard_Name"]:
                 item["standard_name"] = match["Standard_Name"]
             if match["Category"]:
                 item["category"] = match["Category"]
+            if match["For"]:
+                item["for_whom"] = match["For"]
         corrected.append(item)
     return corrected
 
@@ -296,56 +314,54 @@ def learn_from_corrections(
     edited_items: list[dict],
     merchant: str,
 ) -> int:
-    """
-    Compare original Gemini output with user-edited version.
-    If the user changed an item name, standard_name, or category, record the mapping.
-    Returns number of new dictionary entries added.
-    """
     if len(original_items) != len(edited_items):
-        return 0  # rows were added/removed, skip learning
-
+        return 0
     dictionary = load_dictionary()
     existing_keys = {(e["OCR_Name"], e["Merchant"].lower()) for e in dictionary}
-
     new_entries = 0
     for orig, edited in zip(original_items, edited_items):
-        ocr_name = _normalize_for_match(orig.get("item", ""))
+        ocr_name = (orig.get("item") or "").strip().lower()
         if not ocr_name:
             continue
-
         edited_item = (edited.get("Item") or "").strip()
         edited_std = (edited.get("Standard_Name") or "").strip()
         edited_cat = (edited.get("Category") or "").strip()
-
+        edited_for = (edited.get("For") or "").strip()
         orig_item = (orig.get("item") or "").strip()
         orig_std = (orig.get("standard_name") or "").strip()
         orig_cat = (orig.get("category") or "").strip()
-
-        # Check if anything was changed
+        orig_for = (orig.get("for_whom") or "Shared").strip()
         changed = (
             edited_item != orig_item
             or edited_std != orig_std
             or edited_cat != orig_cat
+            or edited_for != orig_for
         )
-
         if changed and (ocr_name, merchant.lower()) not in existing_keys:
             dictionary.append({
                 "OCR_Name": ocr_name,
                 "Corrected_Name": edited_item,
                 "Standard_Name": edited_std or edited_item,
                 "Category": edited_cat or "Other",
+                "For": edited_for or "Shared",
                 "Merchant": merchant,
             })
             existing_keys.add((ocr_name, merchant.lower()))
             new_entries += 1
-
     if new_entries > 0:
         save_dictionary(dictionary)
-
     return new_entries
 
 
-# ── History persistence (unchanged from original) ─────────────────────
+# ── History persistence ───────────────────────────────────────────────
+
+def _parse_for_value(val: Any) -> str:
+    """Safely parse the 'For' field, defaulting to Shared."""
+    s = (str(val) if val is not None else "").strip()
+    if s in FOR_OPTIONS:
+        return s
+    return "Shared"
+
 
 def _gsheets_load_history_rows() -> list[dict]:
     sh = _get_gsheets_client_and_sheet()
@@ -373,6 +389,7 @@ def _gsheets_load_history_rows() -> list[dict]:
             "Quantity": as_int(row.get("Quantity", 1), default=1),
             "Price_ISK": as_int(row.get("Price_ISK", 0), default=0),
             "Category": (row.get("Category") or "Other").strip() or "Other",
+            "For": _parse_for_value(row.get("For")),
         })
     return rows
 
@@ -397,6 +414,7 @@ def _gsheets_save_history_rows(rows: list[dict]) -> None:
             max(1, as_int(r.get("Quantity", 1), default=1)),
             as_int(r.get("Price_ISK", 0), default=0),
             (r.get("Category") or "Other").strip() or "Other",
+            _parse_for_value(r.get("For")),
         ])
     ws.clear()
     ws.update(values, value_input_option="RAW")
@@ -422,6 +440,7 @@ def _gsheets_append_history_rows(*, merchant: str, purchased_on: date, items: It
             as_int(it.get("quantity") or it.get("Quantity", 1), default=1),
             as_int(it.get("price_isk") or it.get("Price_ISK", 0), default=0),
             (it.get("category") or it.get("Category") or "Other").strip() or "Other",
+            _parse_for_value(it.get("for_whom") or it.get("For")),
         ])
     if not out_rows:
         return 0
@@ -508,7 +527,6 @@ def ensure_history_csv_exists_and_up_to_date() -> None:
             w = csv.DictWriter(f, fieldnames=HISTORY_COLUMNS)
             w.writeheader()
         return
-
     with HISTORY_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
         r = csv.reader(f)
         header = next(r, None)
@@ -517,11 +535,9 @@ def ensure_history_csv_exists_and_up_to_date() -> None:
             w = csv.DictWriter(f, fieldnames=HISTORY_COLUMNS)
             w.writeheader()
         return
-
     header_set = {h.strip() for h in header}
     if all(col in header_set for col in HISTORY_COLUMNS):
         return
-
     old_rows = load_history_rows(allow_upgrade=False)
     upgraded = []
     for idx, row in enumerate(old_rows):
@@ -538,6 +554,7 @@ def ensure_history_csv_exists_and_up_to_date() -> None:
             "Quantity": as_int(row.get("Quantity", 1), default=1),
             "Price_ISK": as_int(row.get("Price_ISK", 0), default=0),
             "Category": row.get("Category", "Other"),
+            "For": _parse_for_value(row.get("For")),
         })
     _write_history_rows_no_upgrade(upgraded)
 
@@ -565,6 +582,7 @@ def append_history_rows(*, merchant: str, purchased_on: date, items: Iterable[di
                 "Quantity": as_int(it.get("quantity") or it.get("Quantity", 1), default=1),
                 "Price_ISK": as_int(it.get("price_isk") or it.get("Price_ISK", 0), default=0),
                 "Category": (it.get("category") or it.get("Category") or "Other").strip() or "Other",
+                "For": _parse_for_value(it.get("for_whom") or it.get("For")),
             })
             wrote += 1
     return wrote
@@ -590,6 +608,7 @@ def _write_history_rows_no_upgrade(rows: list[dict]) -> None:
                 "Quantity": max(1, as_int(r.get("Quantity", 1), default=1)),
                 "Price_ISK": as_int(r.get("Price_ISK", 0), default=0),
                 "Category": (r.get("Category") or "Other").strip() or "Other",
+                "For": _parse_for_value(r.get("For")),
             })
 
 
@@ -630,12 +649,13 @@ def load_history_rows(*, allow_upgrade: bool = True) -> list[dict]:
                 "Quantity": as_int(row.get("Quantity", 1), default=1),
                 "Price_ISK": as_int(row.get("Price_ISK", 0), default=0),
                 "Category": (row.get("Category") or "Other").strip() or "Other",
+                "For": _parse_for_value(row.get("For")),
             })
         return rows
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  IMPROVED GEMINI PROMPT
+#  GEMINI PROMPT
 # ══════════════════════════════════════════════════════════════════════
 
 PROMPT = """You are analyzing a photograph of a receipt from an Icelandic store.
@@ -643,73 +663,69 @@ Prices are in ISK (Icelandic króna). The receipt text is in Icelandic.
 
 IMPORTANT RULES FOR ICELANDIC RECEIPTS:
 1. ONLY extract actual purchased products. NEVER include any of these:
-   - "Samtals", "Alls", "Millisamtala" (these are totals/subtotals)
-   - "Afsláttur", "Tilboð" (these are discounts — but DO adjust the product price if a discount applies to a specific item)
-   - "Skilagjald" (deposit fee — skip these entirely)
-   - "Greiðsla", "Debetkort", "Kreditkort", "Kort" (payment method lines)
-   - "Poki", "Plastpoki", "Burðarpoki" (bag charges — skip unless they clearly look like a purchased item)
-   - "Breyting", "Til baka" (change given back)
+   - "Samtals", "Alls", "Millisamtala" (totals/subtotals)
+   - "Afsláttur", "Tilboð" (discounts — but DO adjust the product price if a discount applies to a specific item)
+   - "Skilagjald" (deposit fee — skip entirely)
+   - "Greiðsla", "Debetkort", "Kreditkort", "Kort" (payment lines)
+   - "Poki", "Plastpoki", "Burðarpoki" (bag charges)
+   - "Breyting", "Til baka" (change given)
    - "VSK", "Virðisaukaskattur" (VAT lines)
    - Lines showing only a date, time, register number, or cashier name
 
 2. PRICE PARSING:
-   - Icelandic receipts use periods as thousands separators: "1.299" means 1299 ISK, not 1.299
-   - Some receipts show "2 x 399" meaning 2 items at 399 each; set quantity=2 and price_isk=798 (the TOTAL)
-   - If an item has a discount line right below it (e.g. "-200" or "Afsl. -200"), subtract the discount from the item price
-   - Negative prices are refunds or discounts — skip them unless they clearly apply to the item above
-   - price_isk must always be a positive integer (no dots, commas, or decimals)
+   - Icelandic receipts use periods as thousands separators: "1.299" means 1299 ISK
+   - "2 x 399" means quantity=2, price_isk=798 (the TOTAL paid)
+   - If a discount line applies to the item above, subtract it from the item price
+   - price_isk must be a positive integer
 
 3. WEIGHT-BASED ITEMS:
-   - Items sold by weight show something like "0,456 kg x 1.299 kr/kg = 592"
-   - Use the FINAL price (592 in this example), quantity = 1
+   - "0,456 kg x 1.299 kr/kg = 592" → use final price 592, quantity = 1
 
-4. ICELANDIC CHARACTER ACCURACY:
-   - Preserve these characters exactly: á, ð, é, í, ó, ú, ý, þ, æ, ö, Á, Ð, É, Í, Ó, Ú, Ý, Þ, Æ, Ö
-   - Common items: Nýmjólk, Léttmjólk, Smjör, Brauð, Hrísgrjón, Kartöflur, Laukur, Tómatar, Agúrkur, Bananar, Epli
-   - "Skyr" stays "Skyr", "Pylsur" stays "Pylsur", etc.
+4. ICELANDIC CHARACTERS — preserve exactly:
+   á, ð, é, í, ó, ú, ý, þ, æ, ö, Á, Ð, É, Í, Ó, Ú, Ý, Þ, Æ, Ö
+   Common items: Nýmjólk, Léttmjólk, Smjör, Brauð, Hrísgrjón, Kartöflur,
+   Laukur, Tómatar, Agúrkur, Bananar, Epli, Appelsínur, Pylsur, Kjúklingur
 
 5. MERCHANT DETECTION:
-   - Bónus: yellow-pink bags, pig logo, items often abbreviated
-   - Krónan: blue/white branding
-   - Costco: large quantities, English product names mixed with Icelandic
-   - Hagkaup, Nettó, etc.: detect from receipt header
+   - Bónus: yellow-pink branding, pig logo
+   - Krónan: blue/white
+   - Costco: large quantities, English names mixed with Icelandic
 
-6. CATEGORIES — assign exactly one:
-   - Protein: Skyr, chicken (kjúklingur), fish (fiskur), beef (nautakjöt), pork (svínakjöt), lamb (lambakjöt), eggs (egg), harðfiskur, protein powder/bars, pylsur, hangikjöt, sardínur, túnfiskur
-   - Vegetables: agúrka/agúrkur, tómatar, laukur, gulrætur, paprika, brókkólí, salat, spinat, grænmeti, spergilkál
-   - Fruits: bananar, epli, appelsínur, jarðarber, bláber, hráberjasafi, ávextir, vindruvor
-   - Dairy: mjólk, nýmjólk, léttmjólk, rjómi, ostur, smjör, mysingur (NOT Skyr — Skyr goes under Protein)
-   - Grains & Bakery: brauð, hrísgrjón, pasta, hafragrautur, morgunkorn, tortilla, flatbaka
-   - Beverages: gosdrykk, safi, kaffi, te, áfengi, bjór, vatn, orkudrykk, Coca Cola, Pepsi, Egils
-   - Snacks & Sweets: sælgæti, súkkulaði, snarl, flögur, kex, chips, hnetur
-   - Household: hreinsiefni, þvottaefni, tuttpappír, eldhúsrúlla, vökvadiskefni
-   - Health & Beauty: sápa, sjampó, tannkrem, tannbursti, rakblöð, deodorant
-   - Clothing: föt, sokkar, bolur
-   - Electronics: snúra, hleðslutæki, rafhlöður
-   - Other: anything that does not clearly fit above
+6. CATEGORIES — assign exactly one of these nine:
+   - Food: groceries for cooking/eating at home — meat, fish, dairy, eggs, skyr,
+     vegetables, fruits, bread, rice, pasta, frozen meals, cooking oil, spices, etc.
+   - Fast Food: takeaway meals, restaurant food, Domino's, Subway, pylsur from stands, etc.
+   - Candy & Snacks: sælgæti, súkkulaði, chips, kex, ís (ice cream), nammi, snarl, hnetur
+   - Drinks: non-alcoholic — gosdrykk, safi, kaffi, te, vatn, orkudrykk, Coca Cola, Pepsi, Egils Appelsín
+   - Alcohol: bjór, vín, áfengi, vodka, gin, anything from Vínbúðin/ÁTVR
+   - Clothing: föt, sokkar, bolur, jakki, skór
+   - Household: hreinsiefni, þvottaefni, tuttpappír, eldhúsrúlla, disk-, þvotta-, gler-efni,
+     poki, vökvadiskefni, rakari, ljós, plásttaska
+   - Health & Beauty: sápa, sjampó, tannkrem, tannbursti, rakblöð, deodorant, lyf, plástur
+   - Other: anything that does not clearly fit above (electronics, gifts, etc.)
 
-7. STANDARD NAMES — normalize common staples for tracking:
-   - Any Skyr product → standard_name = "Skyr"
-   - Any chicken product → standard_name = "Kjúklingur"
-   - Any egg carton → standard_name = "Egg"
-   - Any milk → standard_name = "Mjólk"
-   - Any bread → standard_name = "Brauð"
-   - Any banana → standard_name = "Bananar"
-   - Any rice → standard_name = "Hrísgrjón"
-   - For everything else, use the item name as standard_name
+7. STANDARD NAMES — normalize for tracking:
+   - Any Skyr → "Skyr"
+   - Any chicken → "Kjúklingur"
+   - Any egg carton → "Egg"
+   - Any milk → "Mjólk"
+   - Any bread → "Brauð"
+   - Any banana → "Bananar"
+   - Any rice → "Hrísgrjón"
+   - Any butter → "Smjör"
+   - Any potato → "Kartöflur"
+   - Any tomato → "Tómatar"
+   - Otherwise use the item name
 
 Return ONLY a single valid JSON object, no markdown fences:
 {"merchant": "Store Name", "items": [{"item": "Exact receipt text", "standard_name": "Normalized", "quantity": 1, "price_isk": 0, "category": "..."}, ...]}"""
 
 
 def analyze_receipt_with_gemini(image_bytes: bytes) -> dict:
-    """Send receipt image to Gemini and return parsed JSON with merchant and items."""
     image = Image.open(io.BytesIO(image_bytes))
     model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content([PROMPT, image])
     text = response.text.strip()
-
-    # Remove markdown code block if present
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -723,12 +739,6 @@ def analyze_receipt_with_gemini(image_bytes: bytes) -> dict:
 
 
 def postprocess_items(items: list[dict]) -> list[dict]:
-    """
-    Clean up Gemini output:
-    - Remove junk lines that slipped through
-    - Ensure prices are positive integers
-    - Remove items with zero or negative price
-    """
     cleaned = []
     for item in items:
         name = (item.get("item") or "").strip()
@@ -742,8 +752,13 @@ def postprocess_items(items: list[dict]) -> list[dict]:
         item = dict(item)
         item["price_isk"] = price
         item["quantity"] = max(1, as_int(item.get("quantity", 1), default=1))
-        item["category"] = (item.get("category") or "Other").strip() or "Other"
+        cat = (item.get("category") or "Other").strip()
+        if cat not in CATEGORIES:
+            cat = "Other"
+        item["category"] = cat
         item["standard_name"] = (item.get("standard_name") or name).strip()
+        if "for_whom" not in item:
+            item["for_whom"] = "Shared"
         cleaned.append(item)
     return cleaned
 
@@ -754,7 +769,7 @@ def postprocess_items(items: list[dict]) -> list[dict]:
 
 st.set_page_config(page_title="Receipt Scanner", page_icon="🧾", layout="centered")
 st.title("🧾 Receipt Scanner")
-st.caption("Scan receipts and build a spending history. Now with auto-learning corrections!")
+st.caption("Scan receipts · Track spending · Me / AG / Shared")
 
 
 def get_api_key() -> Optional[str]:
@@ -795,7 +810,6 @@ with tab_scanner:
     if image_data:
         receipt_id = hashlib.sha1(image_data).hexdigest()
 
-        # Only analyze if we haven't already (prevents re-running on every interaction)
         if st.session_state.get("current_receipt_id") != receipt_id:
             with st.spinner("Analyzing receipt with Gemini…"):
                 try:
@@ -806,30 +820,22 @@ with tab_scanner:
 
             merchant = (data.get("merchant") or "Unknown").strip() or "Unknown"
             raw_items = data.get("items") or []
-
-            # Post-process: remove junk lines
             clean_items = postprocess_items(raw_items)
-
-            # Apply dictionary corrections
             corrected_items = apply_dictionary(clean_items, merchant)
 
-            # Store in session state
             st.session_state["current_receipt_id"] = receipt_id
             st.session_state["current_merchant"] = merchant
-            st.session_state["current_raw_items"] = clean_items  # before dictionary
+            st.session_state["current_raw_items"] = clean_items
             st.session_state["current_items"] = corrected_items
             st.session_state["current_image"] = image_data
 
-        # Retrieve from session state
         merchant = st.session_state.get("current_merchant", "Unknown")
         items = st.session_state.get("current_items", [])
         raw_items = st.session_state.get("current_raw_items", [])
 
-        # Show image
         st.subheader("Receipt image")
         st.image(image_data, use_container_width=True)
 
-        # Merchant + date
         st.subheader("Purchase details")
         col_a, col_b = st.columns([2, 1])
         with col_a:
@@ -839,15 +845,9 @@ with tab_scanner:
 
         # ── EDITABLE review table ─────────────────────────────────────
         st.subheader("Review & edit items")
-        st.caption("✏️ Fix any errors below before saving. Your corrections will be remembered for future scans.")
+        st.caption("✏️ Fix errors, set **For** (Me/AG/Shared), then save. Corrections are remembered!")
 
         if items:
-            CATEGORY_OPTIONS = [
-                "Protein", "Vegetables", "Fruits", "Dairy", "Grains & Bakery",
-                "Beverages", "Snacks & Sweets", "Food",
-                "Household", "Health & Beauty", "Clothing", "Electronics", "Other",
-            ]
-
             editable_items = [
                 {
                     "Keep": True,
@@ -856,6 +856,7 @@ with tab_scanner:
                     "Quantity": max(1, as_int(it.get("quantity", 1), default=1)),
                     "Price_ISK": as_int(it.get("price_isk", 0), default=0),
                     "Category": (it.get("category") or "Other").strip(),
+                    "For": (it.get("for_whom") or "Shared").strip(),
                 }
                 for it in items
                 if (it.get("item") or "").strip()
@@ -865,35 +866,46 @@ with tab_scanner:
                 editable_items,
                 use_container_width=True,
                 hide_index=True,
-                num_rows="dynamic",  # allow adding missed items
+                num_rows="dynamic",
                 column_config={
                     "Keep": st.column_config.CheckboxColumn("Keep", default=True),
                     "Item": st.column_config.TextColumn("Item (receipt text)"),
                     "Standard_Name": st.column_config.TextColumn("Standard name"),
                     "Quantity": st.column_config.NumberColumn("Qty", format="%d", min_value=1),
                     "Price_ISK": st.column_config.NumberColumn("Price (ISK)", format="%d", min_value=0),
-                    "Category": st.column_config.SelectboxColumn("Category", options=CATEGORY_OPTIONS),
+                    "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                    "For": st.column_config.SelectboxColumn("For", options=FOR_OPTIONS),
                 },
                 key="item_editor",
             )
 
-            # Calculate total from kept items
             kept = [r for r in edited if r.get("Keep", True)]
             total_isk = sum(as_int(r.get("Price_ISK", 0)) for r in kept)
-            st.metric("Total", fmt_isk(total_isk))
+
+            # Show total + breakdown
+            col_t, col_me, col_ag, col_sh = st.columns(4)
+            with col_t:
+                st.metric("Total", fmt_isk(total_isk))
+            me_total = sum(as_int(r.get("Price_ISK", 0)) for r in kept if r.get("For") == "Me")
+            ag_total = sum(as_int(r.get("Price_ISK", 0)) for r in kept if r.get("For") == "AG")
+            shared_total = sum(as_int(r.get("Price_ISK", 0)) for r in kept if r.get("For") == "Shared")
+            with col_me:
+                st.metric("Me", fmt_isk(me_total))
+            with col_ag:
+                st.metric("AG", fmt_isk(ag_total))
+            with col_sh:
+                st.metric("Shared", fmt_isk(shared_total))
 
             already_saved = st.session_state.get("last_accepted_receipt_id") == receipt_id
             accept = st.button("Accept & save to history", type="primary", disabled=already_saved)
             if already_saved:
-                st.caption("✅ Already saved for this receipt in this session.")
+                st.caption("✅ Already saved for this receipt.")
 
             if accept:
-                # Learn from corrections before saving
                 learned = learn_from_corrections(raw_items, kept, merchant)
                 if learned:
-                    st.info(f"📚 Learned {learned} new product correction(s) for future scans.")
+                    st.info(f"📚 Learned {learned} new correction(s) for future scans.")
 
-                # Build items for saving
                 save_items = [
                     {
                         "item": (r.get("Item") or "").strip(),
@@ -901,6 +913,7 @@ with tab_scanner:
                         "quantity": as_int(r.get("Quantity", 1), default=1),
                         "price_isk": as_int(r.get("Price_ISK", 0), default=0),
                         "category": (r.get("Category") or "Other").strip(),
+                        "for_whom": (r.get("For") or "Shared").strip(),
                     }
                     for r in kept
                     if (r.get("Item") or "").strip()
@@ -912,7 +925,7 @@ with tab_scanner:
                     if wrote:
                         st.success(f"Saved {wrote} items to history.")
                     else:
-                        st.warning("Nothing was saved (no valid line items found).")
+                        st.warning("Nothing saved (no valid items).")
                 except Exception as e:
                     st.error(f"Save failed: {e}")
         else:
@@ -926,9 +939,8 @@ with tab_scanner:
 with tab_dictionary:
     st.subheader("Product Dictionary")
     st.caption(
-        "These are corrections the app has learned from your edits. "
-        "When the scanner sees an OCR name it's seen before, it auto-corrects it. "
-        "You can also add entries manually."
+        "Auto-learned corrections from your edits. When the scanner sees an OCR name "
+        "it recognizes, it auto-corrects the name, category, and For assignment."
     )
 
     dict_entries = load_dictionary()
@@ -941,6 +953,7 @@ with tab_dictionary:
                 "Corrected_Name": e["Corrected_Name"],
                 "Standard_Name": e["Standard_Name"],
                 "Category": e["Category"],
+                "For": e.get("For", ""),
                 "Merchant": e["Merchant"],
             }
             for e in dict_entries
@@ -953,6 +966,8 @@ with tab_dictionary:
             num_rows="dynamic",
             column_config={
                 "Delete": st.column_config.CheckboxColumn("Delete"),
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "For": st.column_config.SelectboxColumn("For", options=[""] + FOR_OPTIONS),
             },
             key="dict_editor",
         )
@@ -964,6 +979,7 @@ with tab_dictionary:
                     "Corrected_Name": (r.get("Corrected_Name") or "").strip(),
                     "Standard_Name": (r.get("Standard_Name") or "").strip(),
                     "Category": (r.get("Category") or "").strip(),
+                    "For": (r.get("For") or "").strip(),
                     "Merchant": (r.get("Merchant") or "").strip(),
                 }
                 for r in dict_edited
@@ -973,15 +989,16 @@ with tab_dictionary:
             st.success(f"Dictionary saved with {len(new_dict)} entries.")
             st.rerun()
     else:
-        st.info(
-            "No entries yet. The dictionary grows automatically as you correct items in the Scanner tab. "
-            "You can also add entries manually below."
-        )
+        st.info("No entries yet. The dictionary grows as you correct items in the Scanner tab.")
         manual_dict = st.data_editor(
-            [{"OCR_Name": "", "Corrected_Name": "", "Standard_Name": "", "Category": "", "Merchant": ""}],
+            [{"OCR_Name": "", "Corrected_Name": "", "Standard_Name": "", "Category": "", "For": "", "Merchant": ""}],
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
+            column_config={
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "For": st.column_config.SelectboxColumn("For", options=[""] + FOR_OPTIONS),
+            },
             key="dict_manual_add",
         )
         if st.button("Save manual entries"):
@@ -991,6 +1008,7 @@ with tab_dictionary:
                     "Corrected_Name": (r.get("Corrected_Name") or "").strip(),
                     "Standard_Name": (r.get("Standard_Name") or "").strip(),
                     "Category": (r.get("Category") or "").strip(),
+                    "For": (r.get("For") or "").strip(),
                     "Merchant": (r.get("Merchant") or "").strip(),
                 }
                 for r in manual_dict
@@ -998,7 +1016,7 @@ with tab_dictionary:
             ]
             if new_entries:
                 save_dictionary(new_entries)
-                st.success(f"Added {len(new_entries)} entries to dictionary.")
+                st.success(f"Added {len(new_entries)} entries.")
                 st.rerun()
 
 
@@ -1037,25 +1055,43 @@ with tab_insights:
         st.stop()
 
     total_spend = sum(r["Price_ISK"] for r in filtered)
-    st.metric("Total spend", fmt_isk(total_spend))
 
-    # Manual additions for forgotten receipts
+    # ── Top-level metrics with Me/AG/Shared split ─────────────────
+    me_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "Me")
+    ag_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "AG")
+    shared_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "Shared")
+
+    col_t, col_me, col_ag, col_sh = st.columns(4)
+    with col_t:
+        st.metric("Total spend", fmt_isk(total_spend))
+    with col_me:
+        st.metric("Me", fmt_isk(me_spend))
+    with col_ag:
+        st.metric("AG", fmt_isk(ag_spend))
+    with col_sh:
+        st.metric("Shared", fmt_isk(shared_spend))
+
+    # Manual purchase entry
     with st.expander("Add manual purchase (no receipt)"):
         m_date = st.date_input("Manual purchase date", value=today, key="manual_date")
         m_merchant = st.text_input("Merchant (optional)", value="", key="manual_merchant")
         m_total = st.number_input("Total amount (ISK)", min_value=0, step=100, key="manual_total")
-        st.caption("Optionally break the total into staples or categories.")
+        m_category = st.selectbox("Category", CATEGORIES, key="manual_category")
+        m_for = st.selectbox("For", FOR_OPTIONS, key="manual_for")
+        st.caption("Optionally break the total into specific items:")
         breakdown_default = [
-            {"Standard_Name": "Skyr", "Category": "Protein", "Amount_ISK": 0},
-            {"Standard_Name": "Egg", "Category": "Protein", "Amount_ISK": 0},
-            {"Standard_Name": "Vegetables", "Category": "Vegetables", "Amount_ISK": 0},
+            {"Item": "", "Standard_Name": "", "Category": m_category, "For": m_for, "Amount_ISK": 0},
         ]
         breakdown = st.data_editor(
             breakdown_default,
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
-            column_config={"Amount_ISK": st.column_config.NumberColumn(format="%d")},
+            column_config={
+                "Amount_ISK": st.column_config.NumberColumn(format="%d"),
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "For": st.column_config.SelectboxColumn("For", options=FOR_OPTIONS),
+            },
             key="manual_breakdown",
         )
         if st.button("Save manual purchase"):
@@ -1068,67 +1104,92 @@ with tab_insights:
                     amt = as_int(row.get("Amount_ISK", 0), default=0)
                     if amt <= 0:
                         continue
-                    std = (row.get("Standard_Name") or "").strip()
-                    cat = (row.get("Category") or "Food").strip() or "Food"
-                    item_name = std or cat or "Manual item"
+                    item_name = (row.get("Item") or row.get("Standard_Name") or "Manual item").strip()
+                    std = (row.get("Standard_Name") or item_name).strip()
+                    cat = (row.get("Category") or m_category).strip()
+                    for_whom = (row.get("For") or m_for).strip()
                     items_for_append.append({
-                        "item": item_name, "standard_name": std or item_name,
-                        "quantity": 1, "price_isk": amt, "category": cat,
+                        "item": item_name, "standard_name": std,
+                        "quantity": 1, "price_isk": amt,
+                        "category": cat, "for_whom": for_whom,
                     })
                     allocated += amt
 
                 remaining = max(0, m_total - allocated)
                 if remaining > 0:
                     items_for_append.append({
-                        "item": "Manual remainder", "standard_name": "Other Food",
-                        "quantity": 1, "price_isk": remaining, "category": "Food",
+                        "item": "Manual remainder", "standard_name": "Manual remainder",
+                        "quantity": 1, "price_isk": remaining,
+                        "category": m_category, "for_whom": m_for,
                     })
 
                 if not items_for_append:
                     items_for_append.append({
-                        "item": "Manual total", "standard_name": "Manual total",
-                        "quantity": 1, "price_isk": m_total, "category": "Food",
+                        "item": "Manual purchase", "standard_name": "Manual purchase",
+                        "quantity": 1, "price_isk": m_total,
+                        "category": m_category, "for_whom": m_for,
                     })
 
                 wrote = append_history_rows(merchant=(m_merchant or "Manual").strip(), purchased_on=m_date, items=items_for_append)
                 if wrote:
-                    st.success(f"Saved {wrote} manual items to history.")
+                    st.success(f"Saved {wrote} manual items.")
                     st.rerun()
                 else:
                     st.error("Nothing was saved.")
 
-    # Category spending
-    def parent_category(cat: str) -> str:
-        base = (cat or "Other").strip()
-        if base in {"Vegetables", "Fruits"}:
-            return "Food"
-        return base
-
-    parent_totals: dict[str, int] = defaultdict(int)
-    items_by_parent: dict[str, list[dict]] = defaultdict(list)
-    for r in filtered:
-        p = parent_category(r["Category"])
-        parent_totals[p] += r["Price_ISK"]
-        items_by_parent[p].append(r)
-
+    # ── Spending by category ──────────────────────────────────────
     st.subheader("Spending by category")
-    for parent, total in sorted(parent_totals.items(), key=lambda x: x[1], reverse=True):
-        with st.expander(f"{parent}: {fmt_isk(total)}", expanded=False):
+
+    cat_totals: dict[str, int] = defaultdict(int)
+    cat_for_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    items_by_cat: dict[str, list[dict]] = defaultdict(list)
+
+    for r in filtered:
+        cat = r["Category"]
+        cat_totals[cat] += r["Price_ISK"]
+        cat_for_totals[cat][r.get("For", "Shared")] += r["Price_ISK"]
+        items_by_cat[cat].append(r)
+
+    for cat, total in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True):
+        for_breakdown = cat_for_totals[cat]
+        parts = []
+        if for_breakdown.get("Me", 0) > 0:
+            parts.append(f"Me: {fmt_isk(for_breakdown['Me'])}")
+        if for_breakdown.get("AG", 0) > 0:
+            parts.append(f"AG: {fmt_isk(for_breakdown['AG'])}")
+        if for_breakdown.get("Shared", 0) > 0:
+            parts.append(f"Shared: {fmt_isk(for_breakdown['Shared'])}")
+        subtitle = " · ".join(parts) if parts else ""
+
+        with st.expander(f"{cat}: {fmt_isk(total)}" + (f"  ({subtitle})" if subtitle else ""), expanded=False):
             detail_rows = [
                 {
                     "Date": row["Date"].isoformat(),
                     "Merchant": row["Merchant"],
-                    "Category": row["Category"],
                     "Item": row["Item"],
                     "Standard_Name": row.get("Standard_Name", row["Item"]),
-                    "Quantity": row["Quantity"],
-                    "Price (ISK)": fmt_isk(row["Price_ISK"]),
+                    "Qty": row["Quantity"],
+                    "Price": fmt_isk(row["Price_ISK"]),
+                    "For": row.get("For", "Shared"),
                 }
-                for row in sorted(items_by_parent[parent], key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
+                for row in sorted(items_by_cat[cat], key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
             ]
             st.dataframe(detail_rows, use_container_width=True, hide_index=True)
 
-    # Top 5 most purchased
+    # ── AG spending summary ───────────────────────────────────────
+    if ag_spend > 0:
+        st.subheader("AG spending breakdown")
+        ag_items = [r for r in filtered if r.get("For") == "AG"]
+        ag_cat_totals: dict[str, int] = defaultdict(int)
+        for r in ag_items:
+            ag_cat_totals[r["Category"]] += r["Price_ISK"]
+        ag_summary = [
+            {"Category": cat, "Spend": fmt_isk(total)}
+            for cat, total in sorted(ag_cat_totals.items(), key=lambda x: x[1], reverse=True)
+        ]
+        st.dataframe(ag_summary, use_container_width=True, hide_index=True)
+
+    # ── Top purchased items ───────────────────────────────────────
     item_qty: Counter[str] = Counter()
     item_spend: defaultdict[str, int] = defaultdict(int)
     display_name: dict[str, str] = {}
@@ -1143,15 +1204,15 @@ with tab_insights:
 
     top_keys = sorted(item_qty.keys(), key=lambda k: (item_qty[k], item_spend[k]), reverse=True)[:5]
     top_items = [
-        {"Item": display_name[k], "Total quantity": item_qty[k], "Total spend (ISK)": fmt_isk(item_spend[k])}
+        {"Item": display_name[k], "Total qty": item_qty[k], "Total spend": fmt_isk(item_spend[k])}
         for k in top_keys
     ]
     st.subheader("Top 5 most purchased items")
     st.dataframe(top_items, use_container_width=True, hide_index=True)
 
-    # Edit/delete transactions
+    # ── Edit / delete transactions ────────────────────────────────
     st.subheader("Edit / delete transactions")
-    st.caption("Edit values and click **Save changes**. Mark rows for deletion using the checkbox.")
+    st.caption("Edit values and click **Save changes**.")
 
     all_rows = rows
     editable = [
@@ -1165,6 +1226,7 @@ with tab_insights:
             "Quantity": r["Quantity"],
             "Price_ISK": r["Price_ISK"],
             "Category": r["Category"],
+            "For": r.get("For", "Shared"),
         }
         for r in sorted(filtered, key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
     ]
@@ -1179,6 +1241,8 @@ with tab_insights:
             "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
             "Price_ISK": st.column_config.NumberColumn(format="%d"),
             "Quantity": st.column_config.NumberColumn(format="%d"),
+            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+            "For": st.column_config.SelectboxColumn("For", options=FOR_OPTIONS),
         },
         key="history_editor",
     )
@@ -1190,7 +1254,6 @@ with tab_insights:
         st.button("Reload history")
 
     if save_changes:
-        keep_ids = set()
         updated_rows = {}
         errors = []
         for r in edited:
@@ -1217,14 +1280,15 @@ with tab_insights:
             price = as_int(r.get("Price_ISK", 0), default=0)
             cat = (r.get("Category") or "Other").strip() or "Other"
             merch = (r.get("Merchant") or "").strip() or "Unknown"
-            keep_ids.add(row_id)
+            for_val = _parse_for_value(r.get("For"))
             updated_rows[row_id] = {
                 "Row_ID": row_id, "Merchant": merch, "Date": d, "Item": item,
-                "Standard_Name": std, "Quantity": qty, "Price_ISK": price, "Category": cat,
+                "Standard_Name": std, "Quantity": qty, "Price_ISK": price,
+                "Category": cat, "For": for_val,
             }
 
         if errors:
-            st.error("Could not save due to validation errors:\n- " + "\n- ".join(errors))
+            st.error("Validation errors:\n- " + "\n- ".join(errors))
         else:
             new_all = []
             deleted_ids = {str(r.get("Row_ID")).strip() for r in edited if r.get("Delete")}
@@ -1240,7 +1304,7 @@ with tab_insights:
             st.success("History saved.")
             st.rerun()
 
-    # Budgets
+    # ── Monthly budgets ───────────────────────────────────────────
     st.subheader("Monthly budgets")
     history_months = sorted({yearmonth(r["Date"]) for r in rows})
     default_month = yearmonth(date.today())
