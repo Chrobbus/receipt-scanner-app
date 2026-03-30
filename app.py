@@ -206,9 +206,36 @@ def using_gsheets() -> bool:
         return False
 
 
+# ── Session-state cache to avoid GSheets rate limits ──────────────────
+# Each key stores {"data": ..., "ts": datetime}. Reads are served from
+# cache if less than CACHE_TTL seconds old. Writes clear the relevant key.
+CACHE_TTL = 120  # seconds
+
+def _cache_get(key: str) -> Optional[Any]:
+    """Return cached value if fresh, else None."""
+    entry = st.session_state.get(f"_cache_{key}")
+    if entry and (datetime.now() - entry["ts"]).total_seconds() < CACHE_TTL:
+        return entry["data"]
+    return None
+
+def _cache_set(key: str, data: Any) -> None:
+    st.session_state[f"_cache_{key}"] = {"data": data, "ts": datetime.now()}
+
+def _cache_clear(key: str) -> None:
+    st.session_state.pop(f"_cache_{key}", None)
+
+
 # ── Product Dictionary ────────────────────────────────────────────────
 
 def load_dictionary() -> list[dict]:
+    cached = _cache_get("dictionary")
+    if cached is not None:
+        return cached
+    result = _load_dictionary_uncached()
+    _cache_set("dictionary", result)
+    return result
+
+def _load_dictionary_uncached() -> list[dict]:
     if using_gsheets():
         sh = _get_gsheets_client_and_sheet()
         if sh is None:
@@ -246,6 +273,7 @@ def load_dictionary() -> list[dict]:
 
 
 def save_dictionary(entries: list[dict]) -> None:
+    _cache_clear("dictionary")
     if using_gsheets():
         sh = _get_gsheets_client_and_sheet()
         if sh is None:
@@ -489,6 +517,14 @@ def ensure_budgets_csv_exists() -> None:
 
 
 def load_budgets() -> list[dict]:
+    cached = _cache_get("budgets")
+    if cached is not None:
+        return cached
+    result = _load_budgets_uncached()
+    _cache_set("budgets", result)
+    return result
+
+def _load_budgets_uncached() -> list[dict]:
     if using_gsheets():
         return _gsheets_load_budgets()
     if not BUDGETS_CSV_PATH.exists():
@@ -506,6 +542,7 @@ def load_budgets() -> list[dict]:
 
 
 def save_budgets(rows: list[dict]) -> None:
+    _cache_clear("budgets")
     if using_gsheets():
         _gsheets_save_budgets(rows)
         return
@@ -560,6 +597,7 @@ def ensure_history_csv_exists_and_up_to_date() -> None:
 
 
 def append_history_rows(*, merchant: str, purchased_on: date, items: Iterable[dict]) -> int:
+    _cache_clear("history")
     if using_gsheets():
         return _gsheets_append_history_rows(merchant=merchant, purchased_on=purchased_on, items=items)
     ensure_history_csv_exists_and_up_to_date()
@@ -613,6 +651,7 @@ def _write_history_rows_no_upgrade(rows: list[dict]) -> None:
 
 
 def save_history_rows(rows: list[dict]) -> None:
+    _cache_clear("history")
     if using_gsheets():
         _gsheets_save_history_rows(rows)
         return
@@ -621,6 +660,14 @@ def save_history_rows(rows: list[dict]) -> None:
 
 
 def load_history_rows(*, allow_upgrade: bool = True) -> list[dict]:
+    cached = _cache_get("history")
+    if cached is not None:
+        return cached
+    result = _load_history_rows_uncached(allow_upgrade=allow_upgrade)
+    _cache_set("history", result)
+    return result
+
+def _load_history_rows_uncached(*, allow_upgrade: bool = True) -> list[dict]:
     if using_gsheets():
         return _gsheets_load_history_rows()
     if allow_upgrade:
