@@ -1070,7 +1070,79 @@ with tab_dictionary:
 # ── Insights Tab ──────────────────────────────────────────────────────
 
 with tab_insights:
-    st.subheader("Insights")
+    # ── Custom CSS for the dashboard ──────────────────────────────
+    st.markdown("""
+    <style>
+    /* Metric card styling */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, rgba(30,30,46,0.8), rgba(40,40,60,0.6));
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 16px 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+    div[data-testid="stMetric"] label {
+        font-size: 0.85rem !important;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        opacity: 0.7;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        font-size: 1.6rem !important;
+        font-weight: 700;
+    }
+    /* Category bar styling */
+    .cat-bar-container { margin-bottom: 12px; }
+    .cat-bar-header {
+        display: flex; justify-content: space-between; align-items: baseline;
+        margin-bottom: 4px; font-size: 0.9rem;
+    }
+    .cat-bar-header .cat-name { font-weight: 600; }
+    .cat-bar-header .cat-amount { opacity: 0.8; font-variant-numeric: tabular-nums; }
+    .cat-bar-track {
+        background: rgba(255,255,255,0.06);
+        border-radius: 6px; height: 28px; overflow: hidden;
+        display: flex;
+    }
+    .cat-bar-fill {
+        height: 100%; border-radius: 6px;
+        display: flex; align-items: center; padding-left: 10px;
+        font-size: 0.75rem; font-weight: 600; color: rgba(255,255,255,0.9);
+        min-width: 2px; transition: width 0.4s ease;
+    }
+    .cat-bar-split {
+        display: flex; gap: 6px; margin-top: 3px; font-size: 0.75rem; opacity: 0.55;
+    }
+    /* Budget progress */
+    .budget-row { margin-bottom: 14px; }
+    .budget-header {
+        display: flex; justify-content: space-between; align-items: baseline;
+        margin-bottom: 3px; font-size: 0.88rem;
+    }
+    .budget-header .b-cat { font-weight: 600; }
+    .budget-header .b-nums { font-variant-numeric: tabular-nums; opacity: 0.8; }
+    .budget-track {
+        background: rgba(255,255,255,0.06);
+        border-radius: 6px; height: 22px; overflow: hidden;
+    }
+    .budget-fill {
+        height: 100%; border-radius: 6px;
+        display: flex; align-items: center; justify-content: flex-end;
+        padding-right: 8px; font-size: 0.72rem; font-weight: 600;
+        color: rgba(255,255,255,0.9); transition: width 0.4s ease;
+    }
+    .b-green { background: linear-gradient(90deg, #22c55e, #16a34a); }
+    .b-yellow { background: linear-gradient(90deg, #eab308, #ca8a04); }
+    .b-red { background: linear-gradient(90deg, #ef4444, #dc2626); }
+    .b-gray { background: linear-gradient(90deg, #6b7280, #4b5563); }
+    /* Section dividers */
+    .section-divider {
+        border: none; border-top: 1px solid rgba(255,255,255,0.06);
+        margin: 28px 0 20px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     rows = load_history_rows()
     if not rows:
         st.info("No history yet. Scan a receipt and click **Accept & save to history**.")
@@ -1102,15 +1174,16 @@ with tab_insights:
         st.stop()
 
     total_spend = sum(r["Price_ISK"] for r in filtered)
-
-    # ── Top-level metrics with Me/AG/Shared split ─────────────────
     me_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "Me")
     ag_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "AG")
     shared_spend = sum(r["Price_ISK"] for r in filtered if r.get("For") == "Shared")
 
+    # ══════════════════════════════════════════════════════════════
+    #  HEADER METRICS
+    # ══════════════════════════════════════════════════════════════
     col_t, col_me, col_ag, col_sh = st.columns(4)
     with col_t:
-        st.metric("Total spend", fmt_isk(total_spend))
+        st.metric("Total", fmt_isk(total_spend))
     with col_me:
         st.metric("Me", fmt_isk(me_spend))
     with col_ag:
@@ -1118,8 +1191,266 @@ with tab_insights:
     with col_sh:
         st.metric("Shared", fmt_isk(shared_spend))
 
-    # Manual purchase entry
-    with st.expander("Add manual purchase (no receipt)"):
+    # ══════════════════════════════════════════════════════════════
+    #  CATEGORY SPENDING — VISUAL BARS
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.subheader("Spending by category")
+
+    CAT_COLORS = {
+        "Food": "#22c55e",
+        "Fast Food": "#f97316",
+        "Candy & Snacks": "#ec4899",
+        "Drinks": "#3b82f6",
+        "Alcohol": "#a855f7",
+        "Clothing": "#06b6d4",
+        "Household": "#eab308",
+        "Health & Beauty": "#14b8a6",
+        "Other": "#6b7280",
+    }
+
+    cat_totals: dict[str, int] = defaultdict(int)
+    cat_for_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    items_by_cat: dict[str, list[dict]] = defaultdict(list)
+
+    for r in filtered:
+        cat = r["Category"]
+        cat_totals[cat] += r["Price_ISK"]
+        cat_for_totals[cat][r.get("For", "Shared")] += r["Price_ISK"]
+        items_by_cat[cat].append(r)
+
+    max_cat_total = max(cat_totals.values()) if cat_totals else 1
+
+    sorted_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+    for cat, total in sorted_cats:
+        pct = (total / max_cat_total * 100) if max_cat_total > 0 else 0
+        color = CAT_COLORS.get(cat, "#6b7280")
+        for_bd = cat_for_totals[cat]
+        split_parts = []
+        if for_bd.get("Me", 0) > 0:
+            split_parts.append(f"Me: {fmt_isk(for_bd['Me'])}")
+        if for_bd.get("AG", 0) > 0:
+            split_parts.append(f"AG: {fmt_isk(for_bd['AG'])}")
+        if for_bd.get("Shared", 0) > 0:
+            split_parts.append(f"Shared: {fmt_isk(for_bd['Shared'])}")
+        split_html = f'<div class="cat-bar-split">{" · ".join(split_parts)}</div>' if len(split_parts) > 1 else ""
+        pct_label = f"{total / total_spend * 100:.0f}%" if total_spend > 0 else ""
+
+        st.markdown(f"""
+        <div class="cat-bar-container">
+            <div class="cat-bar-header">
+                <span class="cat-name">{cat}</span>
+                <span class="cat-amount">{fmt_isk(total)}</span>
+            </div>
+            <div class="cat-bar-track">
+                <div class="cat-bar-fill" style="width:{max(pct, 2):.1f}%; background: linear-gradient(90deg, {color}, {color}dd);">
+                    {pct_label}
+                </div>
+            </div>
+            {split_html}
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Expandable details per category
+    for cat, total in sorted_cats:
+        with st.expander(f"View {cat} items"):
+            detail_rows = [
+                {
+                    "Date": row["Date"].isoformat(),
+                    "Merchant": row["Merchant"],
+                    "Item": row["Item"],
+                    "Qty": row["Quantity"],
+                    "Price": fmt_isk(row["Price_ISK"]),
+                    "For": row.get("For", "Shared"),
+                }
+                for row in sorted(items_by_cat[cat], key=lambda x: (x["Date"], x["Item"]))
+            ]
+            st.dataframe(detail_rows, use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════
+    #  AG SPENDING SUMMARY
+    # ══════════════════════════════════════════════════════════════
+    if ag_spend > 0:
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        st.subheader("AG spending")
+        ag_items = [r for r in filtered if r.get("For") == "AG"]
+        ag_cat_totals: dict[str, int] = defaultdict(int)
+        for r in ag_items:
+            ag_cat_totals[r["Category"]] += r["Price_ISK"]
+
+        ag_max = max(ag_cat_totals.values()) if ag_cat_totals else 1
+        for cat, total in sorted(ag_cat_totals.items(), key=lambda x: x[1], reverse=True):
+            pct = (total / ag_max * 100) if ag_max > 0 else 0
+            color = CAT_COLORS.get(cat, "#6b7280")
+            st.markdown(f"""
+            <div class="cat-bar-container">
+                <div class="cat-bar-header">
+                    <span class="cat-name">{cat}</span>
+                    <span class="cat-amount">{fmt_isk(total)}</span>
+                </div>
+                <div class="cat-bar-track">
+                    <div class="cat-bar-fill" style="width:{max(pct, 2):.1f}%; background: linear-gradient(90deg, {color}, {color}dd);">
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════
+    #  DAILY SPENDING TREND
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.subheader("Spending over time")
+
+    daily_spend: dict[date, int] = defaultdict(int)
+    for r in filtered:
+        daily_spend[r["Date"]] += r["Price_ISK"]
+
+    if daily_spend:
+        all_dates = []
+        d = start
+        while d <= end:
+            all_dates.append(d)
+            d += timedelta(days=1)
+        chart_data = {str(d): daily_spend.get(d, 0) for d in all_dates}
+        st.bar_chart(chart_data, height=220, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════
+    #  TOP 5 PURCHASED ITEMS
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.subheader("Top 5 most purchased")
+
+    item_qty: Counter[str] = Counter()
+    item_spend_map: defaultdict[str, int] = defaultdict(int)
+    display_name: dict[str, str] = {}
+    for r in filtered:
+        key = (r.get("Standard_Name") or r.get("Item") or "").strip().lower()
+        if not key or key in ("manual remainder", "manual purchase", "other food", "manual total"):
+            continue
+        display_name.setdefault(key, (r.get("Standard_Name") or r.get("Item") or "").strip())
+        qty = max(1, r["Quantity"])
+        item_qty[key] += qty
+        item_spend_map[key] += r["Price_ISK"]
+
+    top_keys = sorted(item_qty.keys(), key=lambda k: (item_qty[k], item_spend_map[k]), reverse=True)[:5]
+    if top_keys:
+        top_max = item_spend_map[top_keys[0]] if top_keys else 1
+        for rank, k in enumerate(top_keys, 1):
+            pct = (item_spend_map[k] / top_max * 100) if top_max > 0 else 0
+            medal = ["🥇", "🥈", "🥉", "4.", "5."][rank - 1]
+            st.markdown(f"""
+            <div class="cat-bar-container">
+                <div class="cat-bar-header">
+                    <span class="cat-name">{medal} {display_name[k]}</span>
+                    <span class="cat-amount">{item_qty[k]}× · {fmt_isk(item_spend_map[k])}</span>
+                </div>
+                <div class="cat-bar-track">
+                    <div class="cat-bar-fill" style="width:{max(pct, 2):.1f}%; background: linear-gradient(90deg, #3b82f6, #60a5fa);">
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════
+    #  EDIT / DELETE TRANSACTIONS
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+
+    with st.expander("✏️ Edit / Delete transactions"):
+        all_rows = rows
+        editable = [
+            {
+                "Delete": False,
+                "Row_ID": r["Row_ID"],
+                "Date": r["Date"],
+                "Merchant": r["Merchant"],
+                "Item": r["Item"],
+                "Standard_Name": r.get("Standard_Name", r["Item"]),
+                "Quantity": r["Quantity"],
+                "Price_ISK": r["Price_ISK"],
+                "Category": r["Category"],
+                "For": r.get("For", "Shared"),
+            }
+            for r in sorted(filtered, key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
+        ]
+
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Row_ID"],
+            column_config={
+                "Delete": st.column_config.CheckboxColumn(),
+                "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                "Price_ISK": st.column_config.NumberColumn(format="%d"),
+                "Quantity": st.column_config.NumberColumn(format="%d"),
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "For": st.column_config.SelectboxColumn("For", options=FOR_OPTIONS),
+            },
+            key="history_editor",
+        )
+
+        col_save, col_reload = st.columns([1, 1])
+        with col_save:
+            save_changes = st.button("Save changes", type="primary")
+        with col_reload:
+            st.button("Reload history")
+
+        if save_changes:
+            updated_rows = {}
+            errors = []
+            for r in edited:
+                row_id = (r.get("Row_ID") or "").strip()
+                if not row_id:
+                    continue
+                if r.get("Delete"):
+                    continue
+                d_val = r.get("Date")
+                if isinstance(d_val, date):
+                    d = d_val
+                else:
+                    try:
+                        d = datetime.strptime(str(d_val), "%Y-%m-%d").date()
+                    except Exception:
+                        errors.append(f"Invalid date for Row_ID {row_id}")
+                        continue
+                item = (r.get("Item") or "").strip()
+                if not item:
+                    errors.append(f"Empty Item for Row_ID {row_id}")
+                    continue
+                std = (r.get("Standard_Name") or "").strip() or item
+                qty = max(1, as_int(r.get("Quantity", 1), default=1))
+                price = as_int(r.get("Price_ISK", 0), default=0)
+                cat = (r.get("Category") or "Other").strip() or "Other"
+                merch = (r.get("Merchant") or "").strip() or "Unknown"
+                for_val = _parse_for_value(r.get("For"))
+                updated_rows[row_id] = {
+                    "Row_ID": row_id, "Merchant": merch, "Date": d, "Item": item,
+                    "Standard_Name": std, "Quantity": qty, "Price_ISK": price,
+                    "Category": cat, "For": for_val,
+                }
+
+            if errors:
+                st.error("Validation errors:\n- " + "\n- ".join(errors))
+            else:
+                new_all = []
+                deleted_ids = {str(r.get("Row_ID")).strip() for r in edited if r.get("Delete")}
+                for row in all_rows:
+                    rid = row["Row_ID"]
+                    if rid in deleted_ids:
+                        continue
+                    if rid in updated_rows:
+                        new_all.append(updated_rows[rid])
+                    else:
+                        new_all.append(row)
+                save_history_rows(new_all)
+                st.success("History saved.")
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════
+    #  ADD MANUAL PURCHASE
+    # ══════════════════════════════════════════════════════════════
+    with st.expander("➕ Add manual purchase (no receipt)"):
         m_date = st.date_input("Manual purchase date", value=today, key="manual_date")
         m_merchant = st.text_input("Merchant (optional)", value="", key="manual_merchant")
         m_total = st.number_input("Total amount (ISK)", min_value=0, step=100, key="manual_total")
@@ -1184,175 +1515,12 @@ with tab_insights:
                 else:
                     st.error("Nothing was saved.")
 
-    # ── Spending by category ──────────────────────────────────────
-    st.subheader("Spending by category")
+    # ══════════════════════════════════════════════════════════════
+    #  MONTHLY BUDGET TRACKING — VISUAL PROGRESS BARS
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+    st.subheader("Monthly budget")
 
-    cat_totals: dict[str, int] = defaultdict(int)
-    cat_for_totals: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    items_by_cat: dict[str, list[dict]] = defaultdict(list)
-
-    for r in filtered:
-        cat = r["Category"]
-        cat_totals[cat] += r["Price_ISK"]
-        cat_for_totals[cat][r.get("For", "Shared")] += r["Price_ISK"]
-        items_by_cat[cat].append(r)
-
-    for cat, total in sorted(cat_totals.items(), key=lambda x: x[1], reverse=True):
-        for_breakdown = cat_for_totals[cat]
-        parts = []
-        if for_breakdown.get("Me", 0) > 0:
-            parts.append(f"Me: {fmt_isk(for_breakdown['Me'])}")
-        if for_breakdown.get("AG", 0) > 0:
-            parts.append(f"AG: {fmt_isk(for_breakdown['AG'])}")
-        if for_breakdown.get("Shared", 0) > 0:
-            parts.append(f"Shared: {fmt_isk(for_breakdown['Shared'])}")
-        subtitle = " · ".join(parts) if parts else ""
-
-        with st.expander(f"{cat}: {fmt_isk(total)}" + (f"  ({subtitle})" if subtitle else ""), expanded=False):
-            detail_rows = [
-                {
-                    "Date": row["Date"].isoformat(),
-                    "Merchant": row["Merchant"],
-                    "Item": row["Item"],
-                    "Standard_Name": row.get("Standard_Name", row["Item"]),
-                    "Qty": row["Quantity"],
-                    "Price": fmt_isk(row["Price_ISK"]),
-                    "For": row.get("For", "Shared"),
-                }
-                for row in sorted(items_by_cat[cat], key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
-            ]
-            st.dataframe(detail_rows, use_container_width=True, hide_index=True)
-
-    # ── AG spending summary ───────────────────────────────────────
-    if ag_spend > 0:
-        st.subheader("AG spending breakdown")
-        ag_items = [r for r in filtered if r.get("For") == "AG"]
-        ag_cat_totals: dict[str, int] = defaultdict(int)
-        for r in ag_items:
-            ag_cat_totals[r["Category"]] += r["Price_ISK"]
-        ag_summary = [
-            {"Category": cat, "Spend": fmt_isk(total)}
-            for cat, total in sorted(ag_cat_totals.items(), key=lambda x: x[1], reverse=True)
-        ]
-        st.dataframe(ag_summary, use_container_width=True, hide_index=True)
-
-    # ── Top purchased items ───────────────────────────────────────
-    item_qty: Counter[str] = Counter()
-    item_spend: defaultdict[str, int] = defaultdict(int)
-    display_name: dict[str, str] = {}
-    for r in filtered:
-        key = (r.get("Standard_Name") or r.get("Item") or "").strip().lower()
-        if not key:
-            continue
-        display_name.setdefault(key, (r.get("Standard_Name") or r.get("Item") or "").strip())
-        qty = max(1, r["Quantity"])
-        item_qty[key] += qty
-        item_spend[key] += r["Price_ISK"]
-
-    top_keys = sorted(item_qty.keys(), key=lambda k: (item_qty[k], item_spend[k]), reverse=True)[:5]
-    top_items = [
-        {"Item": display_name[k], "Total qty": item_qty[k], "Total spend": fmt_isk(item_spend[k])}
-        for k in top_keys
-    ]
-    st.subheader("Top 5 most purchased items")
-    st.dataframe(top_items, use_container_width=True, hide_index=True)
-
-    # ── Edit / delete transactions ────────────────────────────────
-    st.subheader("Edit / delete transactions")
-    st.caption("Edit values and click **Save changes**.")
-
-    all_rows = rows
-    editable = [
-        {
-            "Delete": False,
-            "Row_ID": r["Row_ID"],
-            "Date": r["Date"],
-            "Merchant": r["Merchant"],
-            "Item": r["Item"],
-            "Standard_Name": r.get("Standard_Name", r["Item"]),
-            "Quantity": r["Quantity"],
-            "Price_ISK": r["Price_ISK"],
-            "Category": r["Category"],
-            "For": r.get("For", "Shared"),
-        }
-        for r in sorted(filtered, key=lambda x: (x["Date"], x["Merchant"], x["Item"]))
-    ]
-
-    edited = st.data_editor(
-        editable,
-        use_container_width=True,
-        hide_index=True,
-        disabled=["Row_ID"],
-        column_config={
-            "Delete": st.column_config.CheckboxColumn(),
-            "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-            "Price_ISK": st.column_config.NumberColumn(format="%d"),
-            "Quantity": st.column_config.NumberColumn(format="%d"),
-            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
-            "For": st.column_config.SelectboxColumn("For", options=FOR_OPTIONS),
-        },
-        key="history_editor",
-    )
-
-    col_save, col_reload = st.columns([1, 1])
-    with col_save:
-        save_changes = st.button("Save changes", type="primary")
-    with col_reload:
-        st.button("Reload history")
-
-    if save_changes:
-        updated_rows = {}
-        errors = []
-        for r in edited:
-            row_id = (r.get("Row_ID") or "").strip()
-            if not row_id:
-                continue
-            if r.get("Delete"):
-                continue
-            d_val = r.get("Date")
-            if isinstance(d_val, date):
-                d = d_val
-            else:
-                try:
-                    d = datetime.strptime(str(d_val), "%Y-%m-%d").date()
-                except Exception:
-                    errors.append(f"Invalid date for Row_ID {row_id}")
-                    continue
-            item = (r.get("Item") or "").strip()
-            if not item:
-                errors.append(f"Empty Item for Row_ID {row_id}")
-                continue
-            std = (r.get("Standard_Name") or "").strip() or item
-            qty = max(1, as_int(r.get("Quantity", 1), default=1))
-            price = as_int(r.get("Price_ISK", 0), default=0)
-            cat = (r.get("Category") or "Other").strip() or "Other"
-            merch = (r.get("Merchant") or "").strip() or "Unknown"
-            for_val = _parse_for_value(r.get("For"))
-            updated_rows[row_id] = {
-                "Row_ID": row_id, "Merchant": merch, "Date": d, "Item": item,
-                "Standard_Name": std, "Quantity": qty, "Price_ISK": price,
-                "Category": cat, "For": for_val,
-            }
-
-        if errors:
-            st.error("Validation errors:\n- " + "\n- ".join(errors))
-        else:
-            new_all = []
-            deleted_ids = {str(r.get("Row_ID")).strip() for r in edited if r.get("Delete")}
-            for row in all_rows:
-                rid = row["Row_ID"]
-                if rid in deleted_ids:
-                    continue
-                if rid in updated_rows:
-                    new_all.append(updated_rows[rid])
-                else:
-                    new_all.append(row)
-            save_history_rows(new_all)
-            st.success("History saved.")
-            st.rerun()
-
-    # ── Monthly budgets ───────────────────────────────────────────
-    st.subheader("Monthly budgets")
     history_months = sorted({yearmonth(r["Date"]) for r in rows})
     default_month = yearmonth(date.today())
     if default_month not in history_months:
@@ -1366,7 +1534,6 @@ with tab_insights:
 
     month_rows = [r for r in rows if month_start <= r["Date"] <= month_end]
     month_total = sum(r["Price_ISK"] for r in month_rows)
-    st.metric("This month spend", fmt_isk(month_total))
 
     month_cat_totals: dict[str, int] = defaultdict(int)
     for r in month_rows:
@@ -1376,49 +1543,93 @@ with tab_insights:
     budgets_for_month = [b for b in budgets_all if b["YearMonth"] == selected_month]
     budget_by_cat = {b["Category"]: b["Budget_ISK"] for b in budgets_for_month}
 
-    known_categories = sorted(set(month_cat_totals.keys()) | set(budget_by_cat.keys()))
-    if "Overall" not in known_categories:
-        known_categories.insert(0, "Overall")
-
-    budget_editor_rows = []
-    for cat in known_categories:
-        budget_editor_rows.append({
-            "Category": cat,
-            "Budget_ISK": budget_by_cat.get(cat, 0),
-            "Spent_ISK": month_total if cat == "Overall" else month_cat_totals.get(cat, 0),
-        })
-
-    budgets_edited = st.data_editor(
-        budget_editor_rows,
-        use_container_width=True,
-        hide_index=True,
-        disabled=["Spent_ISK"],
-        column_config={
-            "Budget_ISK": st.column_config.NumberColumn(format="%d"),
-            "Spent_ISK": st.column_config.NumberColumn(format="%d"),
-        },
-        key="budget_editor",
-    )
-
-    if st.button("Save budgets"):
-        budgets_all = [b for b in budgets_all if b["YearMonth"] != selected_month]
-        for r in budgets_edited:
-            cat = (r.get("Category") or "").strip()
-            if not cat:
-                continue
-            budgets_all.append({
-                "YearMonth": selected_month,
-                "Category": cat,
-                "Budget_ISK": as_int(r.get("Budget_ISK", 0), default=0),
-            })
-        save_budgets(budgets_all)
-        st.success("Budgets saved.")
-        st.rerun()
-
+    # Visual progress bars for budgets that are set
     overall_budget = budget_by_cat.get("Overall", 0)
-    if overall_budget:
-        diff = overall_budget - month_total
-        if diff >= 0:
-            st.success(f"Under budget by {fmt_isk(diff)} (Overall).")
-        else:
-            st.error(f"Over budget by {fmt_isk(abs(diff))} (Overall).")
+    has_any_budget = any(v > 0 for v in budget_by_cat.values())
+
+    if has_any_budget:
+        # Overall first
+        if overall_budget > 0:
+            pct = min(month_total / overall_budget * 100, 100) if overall_budget > 0 else 0
+            bar_class = "b-green" if pct < 75 else ("b-yellow" if pct < 100 else "b-red")
+            over_under = overall_budget - month_total
+            status = f"{'Under' if over_under >= 0 else 'Over'} by {fmt_isk(abs(over_under))}"
+            st.markdown(f"""
+            <div class="budget-row">
+                <div class="budget-header">
+                    <span class="b-cat">Overall</span>
+                    <span class="b-nums">{fmt_isk(month_total)} / {fmt_isk(overall_budget)} — {status}</span>
+                </div>
+                <div class="budget-track">
+                    <div class="budget-fill {bar_class}" style="width:{max(pct, 1):.1f}%;">
+                        {pct:.0f}%
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Category budgets
+        for cat in CATEGORIES:
+            budget_val = budget_by_cat.get(cat, 0)
+            if budget_val <= 0:
+                continue
+            spent = month_cat_totals.get(cat, 0)
+            pct = min(spent / budget_val * 100, 100) if budget_val > 0 else 0
+            bar_class = "b-green" if pct < 75 else ("b-yellow" if pct < 100 else "b-red")
+            st.markdown(f"""
+            <div class="budget-row">
+                <div class="budget-header">
+                    <span class="b-cat">{cat}</span>
+                    <span class="b-nums">{fmt_isk(spent)} / {fmt_isk(budget_val)}</span>
+                </div>
+                <div class="budget-track">
+                    <div class="budget-fill {bar_class}" style="width:{max(pct, 1):.1f}%;">
+                        {pct:.0f}%
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.metric("This month spend", fmt_isk(month_total))
+        st.caption("Set budgets below to see visual progress bars here.")
+
+    # Budget editor (collapsed)
+    with st.expander("Set / edit budgets"):
+        known_categories = sorted(set(month_cat_totals.keys()) | set(budget_by_cat.keys()))
+        if "Overall" not in known_categories:
+            known_categories.insert(0, "Overall")
+
+        budget_editor_rows = []
+        for cat in known_categories:
+            budget_editor_rows.append({
+                "Category": cat,
+                "Budget_ISK": budget_by_cat.get(cat, 0),
+                "Spent_ISK": month_total if cat == "Overall" else month_cat_totals.get(cat, 0),
+            })
+
+        budgets_edited = st.data_editor(
+            budget_editor_rows,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Spent_ISK"],
+            column_config={
+                "Budget_ISK": st.column_config.NumberColumn(format="%d"),
+                "Spent_ISK": st.column_config.NumberColumn(format="%d"),
+            },
+            key="budget_editor",
+        )
+
+        if st.button("Save budgets"):
+            budgets_all = [b for b in budgets_all if b["YearMonth"] != selected_month]
+            for r in budgets_edited:
+                cat = (r.get("Category") or "").strip()
+                if not cat:
+                    continue
+                budgets_all.append({
+                    "YearMonth": selected_month,
+                    "Category": cat,
+                    "Budget_ISK": as_int(r.get("Budget_ISK", 0), default=0),
+                })
+            save_budgets(budgets_all)
+            st.success("Budgets saved.")
+            st.rerun()
